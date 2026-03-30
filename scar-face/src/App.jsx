@@ -50,7 +50,6 @@ const NEWS_IMPACT = {
   low:    { color:"#64748b", bg:"rgba(100,116,139,0.05)", border:"rgba(100,116,139,0.12)",label:"LOW"  },
 };
 
-// TradingView chart links
 const TV_LINKS = {
   OIL:  "https://www.tradingview.com/chart/?symbol=NYMEX%3ACL1%21",
   GOLD: "https://www.tradingview.com/chart/?symbol=OANDA%3AXAUUSD",
@@ -73,14 +72,12 @@ input,button,select{font-family:'JetBrains Mono',monospace;outline:none;-webkit-
 ::-webkit-scrollbar{width:0;height:0}
 `;
 
-// ─── Safe localStorage ────────────────────────────────────────────────
 const store = {
   get:(k)=>{ try{ return localStorage.getItem(k)||""; }catch{ return ""; } },
   set:(k,v)=>{ try{ localStorage.setItem(k,v); }catch{} },
   del:(k)=>{ try{ localStorage.removeItem(k); }catch{} },
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────
 function getNYDecimal(){
   const d=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   return d.getHours()+d.getMinutes()/60;
@@ -111,21 +108,17 @@ async function fetchJSON(url,opts={},ms=9000){
   catch(e){clearTimeout(id);throw e;}
 }
 
-// ─── resolveEffectiveBias — simple and reliable ───────────────────────
-// Priority: Real OHLC structure > Strong price move > AI bias
 function resolveEffectiveBias(aiBias, priceData){
   const hasPrice = (priceData?.live||priceData?.cached) && priceData?.trend!=null;
   const ohlcStr  = priceData?.ohlcStructure;
   const hasOHLC  = ohlcStr && ohlcStr!=="Unknown" && ohlcStr!=="Neutral";
   const moveStrong = Math.abs(priceData?.change||0)>=1.5;
 
-  // Build signals array for conflict detection
   const signals = [];
   if(hasOHLC) signals.push({type:"OHLC", value:ohlcStr});
   if(aiBias && aiBias!=="Neutral") signals.push({type:"AI", value:aiBias});
   if(hasPrice && moveStrong) signals.push({type:"PRICE", value:priceData.trend==="bullish"?"Bullish":"Bearish"});
 
-  // Final bias — OHLC wins if available, else strong price, else AI
   let finalBias = null;
   let source    = "none";
   if(hasOHLC){ finalBias=ohlcStr; source="ohlc"; }
@@ -134,7 +127,6 @@ function resolveEffectiveBias(aiBias, priceData){
 
   if(!finalBias) return{bias:null,overridden:false,source:"none",confidence:"LOW",conflict:false,signals:[]};
 
-  // Confidence
   const bullish = signals.filter(s=>s.value==="Bullish").length;
   const bearish = signals.filter(s=>s.value==="Bearish").length;
   const total   = signals.length;
@@ -151,13 +143,11 @@ function resolveEffectiveBias(aiBias, priceData){
   return{bias:finalBias,overridden,source,confidence,conflict,signals};
 }
 
-// ─── fetchLivePrices — /api/prices serverless ─────────────────────────
 const CACHE_TTL = 5*60*1000;
 const _cache    = {};
 
 async function fetchLivePrices(){
   const now=Date.now();
-  // Primary: Vercel serverless → Twelve Data
   try{
     const r=await fetchJSON("/api/prices",{},8000);
     if(r.ok){
@@ -169,7 +159,6 @@ async function fetchLivePrices(){
       }
     }
   }catch{}
-  // Backup: Groq estimate
   try{
     const today=new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"});
     const r=await fetch("https://api.groq.com/openai/v1/chat/completions",{
@@ -203,7 +192,6 @@ async function fetchLivePrices(){
       }
     }
   }catch{}
-  // Expiring cache
   const out={};
   for(const a of ["OIL","GOLD","NQ"]){
     const c=_cache[a];
@@ -212,7 +200,6 @@ async function fetchLivePrices(){
   return out;
 }
 
-// ─── Fear & Greed ─────────────────────────────────────────────────────
 function fgLabel(v){
   if(v<=24)return"Extreme Fear";
   if(v<=44)return"Fear";
@@ -242,7 +229,6 @@ async function fetchFearGreed(){
   return{value:10,label:"Extreme Fear",live:false,source:"fallback"};
 }
 
-// ─── Momentum ─────────────────────────────────────────────────────────
 function deriveMomentum(prices){
   const out={};
   for(const a of ASSETS){
@@ -254,9 +240,7 @@ function deriveMomentum(prices){
   return{data:out,live:Object.values(out).some(x=>x.live)};
 }
 
-// ─── News — no stale filter, always show what we have ─────────────────
 async function fetchNews(){
-  // Finnhub — show ALL recent news, no time filter
   if(FINNHUB_KEY&&FINNHUB_KEY!=="your_finnhub_key_here"){
     try{
       const allNews=[];
@@ -284,7 +268,6 @@ async function fetchNews(){
       }
     }catch{}
   }
-  // RSS fallback — parallel
   const RSS=[
     {url:"https://feeds.bbci.co.uk/news/business/rss.xml",source:"BBC"},
     {url:"https://feeds.marketwatch.com/marketwatch/realtimeheadlines/",source:"MarketWatch"},
@@ -323,8 +306,7 @@ async function fetchNews(){
   return{news:[],live:false,fetchedAt:new Date()};
 }
 
-// ─── Groq ─────────────────────────────────────────────────────────────
-async function groq(apiKey,messages,max_tokens=1800){
+async function groqAPI(apiKey,messages,max_tokens=1800){
   const r=await fetchJSON("https://api.groq.com/openai/v1/chat/completions",{
     method:"POST",
     headers:{"Content-Type":"application/json",Authorization:`Bearer ${apiKey}`},
@@ -337,7 +319,6 @@ async function groq(apiKey,messages,max_tokens=1800){
   catch{const m=raw.match(/\{[\s\S]*\}/);if(m)return JSON.parse(m[0]);throw new Error("JSON parse failed");}
 }
 
-// ─── analyzeMarket ────────────────────────────────────────────────────
 async function analyzeMarket({fg,momentum,news,apiKey,prices}){
   const newsText=news.slice(0,6).map((h,i)=>`${i+1}. ${h.title}`).join("\n");
   const momText=Object.entries(momentum).map(([k,v])=>
@@ -368,34 +349,20 @@ async function analyzeMarket({fg,momentum,news,apiKey,prices}){
     return"Bearish";
   };
 
-  return groq(apiKey,[
+  return groqAPI(apiKey,[
     {role:"system",content:`You are an ICT trading analyst. Use MARKET STRUCTURE and SMART MONEY context to determine bias. Small moves <1.5% are noise — ignore for bias. Return ONLY valid JSON. No markdown.`},
-    {role:"user",content:`Analyze OIL, GOLD, NQ futures.${hardRule}
-
-Prices and OHLC structure:
-${priceContext}
-
-Fear & Greed: ${fg.value}/100 (${fg.label})
-Momentum: ${momText}
-News:
-${newsText}
-
-KILLZONES: OIL/GOLD=London 2-5AM or NY AM 7-10AM EST | NQ=NY Open 9:30-11AM or NY PM 1-3PM EST
-
-Return JSON (real values, no placeholders):
-{"regime":"<RISK-ON|RISK-OFF|STAGFLATION|UNCERTAINTY|NEUTRAL>","regime_reason":"<sentence>","correlation_warning":"<sentence or null>","dxy_bias":"<Bullish|Bearish|Neutral>","dxy_reason":"<sentence>","session_note":"<sentence>","smart_money_note":"<sentence>","assets":{"OIL":{"bias":"${ohlcHint("OIL")}","confidence":"<High|Medium|Low>","structure":"<real structure description>","move_type":"<3-5 words>","approach":"<specific entry stop target>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price near current>","key_level_bear":"<price near current>","bullish_real_pct":60,"bullish_trap_pct":40,"bearish_real_pct":65,"bearish_trap_pct":35},"GOLD":{"bias":"${ohlcHint("GOLD")}","confidence":"<High|Medium|Low>","structure":"<sentence>","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":65,"bullish_trap_pct":35,"bearish_real_pct":30,"bearish_trap_pct":70},"NQ":{"bias":"${ohlcHint("NQ")}","confidence":"<High|Medium|Low>","structure":"<sentence>","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":25,"bullish_trap_pct":75,"bearish_real_pct":75,"bearish_trap_pct":25}},"pair_trade":"<sentence>","risk_event":"<sentence>","macro_summary":"<two sentences>"}`},
+    {role:"user",content:`Analyze OIL, GOLD, NQ futures.${hardRule}\n\nPrices and OHLC structure:\n${priceContext}\n\nFear & Greed: ${fg.value}/100 (${fg.label})\nMomentum: ${momText}\nNews:\n${newsText}\n\nKILLZONES: OIL/GOLD=London 2-5AM or NY AM 7-10AM EST | NQ=NY Open 9:30-11AM or NY PM 1-3PM EST\n\nReturn JSON (real values, no placeholders):\n{"regime":"<RISK-ON|RISK-OFF|STAGFLATION|UNCERTAINTY|NEUTRAL>","regime_reason":"<sentence>","correlation_warning":"<sentence or null>","dxy_bias":"<Bullish|Bearish|Neutral>","dxy_reason":"<sentence>","session_note":"<sentence>","smart_money_note":"<sentence>","assets":{"OIL":{"bias":"${ohlcHint("OIL")}","confidence":"<High|Medium|Low>","structure":"<real structure description>","move_type":"<3-5 words>","approach":"<specific entry stop target>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price near current>","key_level_bear":"<price near current>","bullish_real_pct":60,"bullish_trap_pct":40,"bearish_real_pct":65,"bearish_trap_pct":35},"GOLD":{"bias":"${ohlcHint("GOLD")}","confidence":"<High|Medium|Low>","structure":"<sentence>","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":65,"bullish_trap_pct":35,"bearish_real_pct":30,"bearish_trap_pct":70},"NQ":{"bias":"${ohlcHint("NQ")}","confidence":"<High|Medium|Low>","structure":"<sentence>","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":25,"bullish_trap_pct":75,"bearish_real_pct":75,"bearish_trap_pct":25}},"pair_trade":"<sentence>","risk_event":"<sentence>","macro_summary":"<two sentences>"}`},
   ],2000);
 }
 
 async function analyzeNews({news,apiKey}){
   const newsText=news.map((h,i)=>`${i+1}. TITLE: ${h.title}\nDESC: ${h.description||"N/A"}`).join("\n\n");
-  return groq(apiKey,[
+  return groqAPI(apiKey,[
     {role:"system",content:"ICT futures analyst. Return ONLY valid JSON."},
     {role:"user",content:`Analyze headlines for OIL, GOLD, NQ impact.\nHeadlines:\n${newsText}\nJSON: {"analyzed":[{"title":"","impact_level":"high","assets":["OIL"],"direction":{"OIL":"bullish","GOLD":"neutral","NQ":"neutral"},"reason":"","category":"geopolitical"}],"market_summary":"2 sentences","top_risk":"sentence","top_opportunity":"sentence"}`},
   ],2200);
 }
 
-// ─── useMarket ────────────────────────────────────────────────────────
 function useMarket(apiKey){
   const [state,setState]=useState({
     status:"idle",market:null,news:[],momentum:{},prices:{},
@@ -467,7 +434,6 @@ function useMarket(apiKey){
 
       setState(s=>({...s,market,prices,status:"live",lastMarketUpdate:new Date(),error:null}));
 
-      // Auto refresh prices every 5 minutes
       clearInterval(timerRef.current);
       timerRef.current=setInterval(()=>refreshPricesOnly(),5*60*1000);
 
@@ -487,7 +453,6 @@ function useMarket(apiKey){
   return{...state,refresh,refreshNews};
 }
 
-// ─── Primitives ───────────────────────────────────────────────────────
 const Dot=({color,pulse,size=7})=>(
   <div style={{width:size,height:size,borderRadius:"50%",background:color,boxShadow:`0 0 ${size+2}px ${color}`,flexShrink:0,animation:pulse?"pdot 1.8s ease-in-out infinite":"none"}}/>
 );
@@ -507,7 +472,6 @@ const ImpactDot=({level})=>{
   return <div style={{width:8,height:8,borderRadius:"50%",background:c,boxShadow:`0 0 6px ${c}`,flexShrink:0}}/>;
 };
 
-// ─── KZ Badge ─────────────────────────────────────────────────────────
 function KZBadge({assetId}){
   const[kz,setKz]=useState(()=>getKZStatus(assetId));
   useEffect(()=>{const t=setInterval(()=>setKz(getKZStatus(assetId)),20000);return()=>clearInterval(t);},[assetId]);
@@ -525,7 +489,6 @@ function KZBadge({assetId}){
   );
 }
 
-// ─── KZ Card ──────────────────────────────────────────────────────────
 function KZCard({asset}){
   const[kz,setKz]=useState(()=>getKZStatus(asset.id));
   const[ny,setNy]=useState(getNYTime);
@@ -594,7 +557,6 @@ function KZCard({asset}){
   );
 }
 
-// ─── Fear Gauge ───────────────────────────────────────────────────────
 function FearGauge({value,label,live,source}){
   const pct=Math.max(0,Math.min(100,value??10));
   const ang=(pct/100)*180,rad=(ang-90)*Math.PI/180;
@@ -625,7 +587,6 @@ function FearGauge({value,label,live,source}){
   );
 }
 
-// ─── DXY Strip ────────────────────────────────────────────────────────
 function DXYStrip({data}){
   if(!data?.dxy_bias)return null;
   const b=data.dxy_bias;
@@ -640,7 +601,6 @@ function DXYStrip({data}){
   );
 }
 
-// ─── Regime Banner ────────────────────────────────────────────────────
 function RegimeBanner({data}){
   if(!data?.regime)return null;
   const c=REGIME_COLORS[data.regime]||REGIME_COLORS["NEUTRAL"];
@@ -656,7 +616,6 @@ function RegimeBanner({data}){
   );
 }
 
-// ─── Momentum Strip ───────────────────────────────────────────────────
 function MomentumStrip({momentum,live}){
   return(
     <div style={{background:"rgba(6,8,16,0.97)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:12,padding:"10px 14px",display:"flex",alignItems:"center",gap:12}}>
@@ -675,7 +634,6 @@ function MomentumStrip({momentum,live}){
   );
 }
 
-// ─── Asset Card ───────────────────────────────────────────────────────
 function AssetCard({asset,data,price}){
   const[open,setOpen]=useState(false);
   const{bias:effectiveBias,overridden,source,confidence,conflict,signals}=resolveEffectiveBias(data?.bias,price);
@@ -688,7 +646,6 @@ function AssetCard({asset,data,price}){
   return(
     <div style={{background:"rgba(5,7,15,0.98)",border:"1px solid rgba(255,255,255,0.06)",borderTop:`3px solid ${asset.color}`,borderRadius:16,overflow:"hidden",boxShadow:`0 4px 24px ${asset.glow}`,animation:"fadeup .35s ease"}}>
       <button onClick={()=>setOpen(v=>!v)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",padding:16,textAlign:"left"}}>
-        {/* Header */}
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div style={{display:"flex",alignItems:"center",gap:12}}>
             <span style={{fontSize:24}}>{asset.emoji}</span>
@@ -719,8 +676,6 @@ function AssetCard({asset,data,price}){
             </div>
           )}
         </div>
-
-        {/* KZ + Confidence */}
         <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10,flexWrap:"wrap"}}>
           <KZBadge assetId={asset.id}/>
           {confidence&&(
@@ -731,8 +686,6 @@ function AssetCard({asset,data,price}){
             </div>
           )}
         </div>
-
-        {/* Conflict warning */}
         {conflict&&(
           <div style={{marginTop:8,background:"rgba(239,68,68,0.07)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:8,padding:"7px 11px",display:"flex",gap:8,alignItems:"flex-start"}}>
             <span style={{color:"#ef4444",flexShrink:0,fontSize:13}}>⚠</span>
@@ -742,7 +695,6 @@ function AssetCard({asset,data,price}){
             </div>
           </div>
         )}
-
         {data&&(
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10}}>
             <span style={{fontFamily:F,fontSize:12,color:asset.color}}>{data.move_type}</span>
@@ -753,17 +705,13 @@ function AssetCard({asset,data,price}){
 
       {open&&(
         <div style={{padding:"0 16px 18px",display:"flex",flexDirection:"column",gap:12,animation:"fadeup .22s ease"}}>
-
-          {/* TradingView */}
           <a href={TV_LINKS[asset.id]} target="_blank" rel="noreferrer"
             style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,background:"rgba(59,130,246,0.08)",border:"1px solid rgba(59,130,246,0.25)",borderRadius:10,padding:"10px 14px",textDecoration:"none",color:"#60a5fa",fontFamily:F,fontSize:11,letterSpacing:1}}>
             📈 Open Live {asset.id} Chart on TradingView ↗
           </a>
-
-          {/* Real OHLC Structure */}
           {price?.ohlcStructure&&price.ohlcStructure!=="Unknown"&&(
             <div style={{background:"rgba(59,130,246,0.06)",border:"1px solid rgba(59,130,246,0.2)",borderLeft:"3px solid #3b82f6",borderRadius:10,padding:"10px 13px"}}>
-              <div style={{fontFamily:F,fontSize:9,color:"#60a5fa",letterSpacing:2,marginBottom:4}}>📐 REAL OHLC STRUCTURE (actual candle data)</div>
+              <div style={{fontFamily:F,fontSize:9,color:"#60a5fa",letterSpacing:2,marginBottom:4}}>📐 REAL OHLC STRUCTURE</div>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
                 <span style={{fontFamily:F,fontSize:13,fontWeight:700,color:price.ohlcStructure==="Bullish"?"#22c55e":price.ohlcStructure==="Bearish"?"#ef4444":"#eab308"}}>
                   {price.ohlcStructure==="Bullish"?"▲ BULLISH":price.ohlcStructure==="Bearish"?"▼ BEARISH":"◆ NEUTRAL"} STRUCTURE
@@ -772,21 +720,19 @@ function AssetCard({asset,data,price}){
               {price.structureDetail&&<div style={{fontFamily:F,fontSize:11,color:"rgba(255,255,255,0.5)",lineHeight:1.6}}>{price.structureDetail}</div>}
               {price.rangeHigh&&price.rangeLow&&(
                 <div style={{display:"flex",gap:12,marginTop:8}}>
-                  <span style={{fontFamily:F,fontSize:10,color:"rgba(255,255,255,0.3)"}}>Range High: <span style={{color:"#22c55e"}}>${price.rangeHigh.toLocaleString()}</span></span>
-                  <span style={{fontFamily:F,fontSize:10,color:"rgba(255,255,255,0.3)"}}>Range Low: <span style={{color:"#ef4444"}}>${price.rangeLow.toLocaleString()}</span></span>
+                  <span style={{fontFamily:F,fontSize:10,color:"rgba(255,255,255,0.3)"}}>High: <span style={{color:"#22c55e"}}>${price.rangeHigh.toLocaleString()}</span></span>
+                  <span style={{fontFamily:F,fontSize:10,color:"rgba(255,255,255,0.3)"}}>Low: <span style={{color:"#ef4444"}}>${price.rangeLow.toLocaleString()}</span></span>
                 </div>
               )}
             </div>
           )}
-
-          {/* Signal Breakdown */}
           {signals&&signals.length>0&&(
             <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:10,padding:"10px 13px"}}>
               <div style={{fontFamily:F,fontSize:9,color:"rgba(255,255,255,0.3)",letterSpacing:2,marginBottom:8}}>SIGNAL BREAKDOWN</div>
               <div style={{display:"flex",flexDirection:"column",gap:6}}>
                 {signals.map((s,i)=>{
                   const sc=s.value==="Bullish"?"#22c55e":s.value==="Bearish"?"#ef4444":"#eab308";
-                  const label=s.type==="OHLC"?"📐 Real OHLC Candles":s.type==="AI"?"🤖 AI Analysis":"📊 Price Momentum";
+                  const label=s.type==="OHLC"?"📐 Real OHLC":s.type==="AI"?"🤖 AI":"📊 Momentum";
                   return(
                     <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                       <span style={{fontFamily:F,fontSize:10,color:"rgba(255,255,255,0.45)"}}>{label}</span>
@@ -799,7 +745,6 @@ function AssetCard({asset,data,price}){
               </div>
             </div>
           )}
-
           {data&&(
             <>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
@@ -831,7 +776,6 @@ function AssetCard({asset,data,price}){
   );
 }
 
-// ─── News Tab ─────────────────────────────────────────────────────────
 function NewsTab({rawNews,newsLive,lastUpdate,apiKey,onRefreshNews}){
   const[analysis,setAnalysis]=useState({status:"idle",data:null,error:null});
   const[filter,setFilter]=useState("ALL");
@@ -971,7 +915,8 @@ function NewsTab({rawNews,newsLive,lastUpdate,apiKey,onRefreshNews}){
   );
 }
 
-// ─── Bias Tab ─────────────────────────────────────────────────────────
+function confIcon(c){ return c==="HIGH"?"✅":c==="MEDIUM"?"⚠️":"🔴"; }
+
 function BiasTab({market,prices}){
   const[userBias,setUserBias]=useState({OIL:null,GOLD:null,NQ:null});
   if(!market)return(
@@ -1004,7 +949,6 @@ function BiasTab({market,prices}){
 
         return(
           <div key={a.id} style={{background:"rgba(5,7,15,0.98)",border:"1px solid rgba(255,255,255,0.06)",borderTop:`3px solid ${a.color}`,borderRadius:16,padding:16,display:"flex",flexDirection:"column",gap:14,boxShadow:`0 4px 24px ${a.glow}`}}>
-            {/* Header */}
             <div style={{display:"flex",alignItems:"center",gap:12}}>
               <span style={{fontSize:24}}>{a.emoji}</span>
               <div style={{flex:1}}>
@@ -1017,7 +961,7 @@ function BiasTab({market,prices}){
                     </span>
                     {p?.price&&<span style={{fontFamily:F,fontSize:11,color:"rgba(255,255,255,0.3)",background:"rgba(255,255,255,0.05)",borderRadius:6,padding:"2px 8px"}}>${p.price.toLocaleString()}</span>}
                     <span style={{fontFamily:F,fontSize:9,color:confColor,background:`${confColor}12`,border:`1px solid ${confColor}25`,borderRadius:6,padding:"2px 8px"}}>
-                      {confidence==="HIGH"?"✅":"confidence==="MEDIUM"?"⚠️":"🔴"} {confidence} CONF
+                      {confIcon(confidence)} {confidence} CONF
                     </span>
                   </div>
                 )}
@@ -1032,7 +976,6 @@ function BiasTab({market,prices}){
 
             <KZBadge assetId={a.id}/>
 
-            {/* OHLC Structure */}
             {p?.ohlcStructure&&p.ohlcStructure!=="Unknown"&&(
               <div style={{background:"rgba(59,130,246,0.06)",border:"1px solid rgba(59,130,246,0.2)",borderLeft:"3px solid #3b82f6",borderRadius:8,padding:"8px 11px"}}>
                 <div style={{fontFamily:F,fontSize:9,color:"#60a5fa",marginBottom:3}}>📐 REAL OHLC STRUCTURE</div>
@@ -1043,7 +986,6 @@ function BiasTab({market,prices}){
               </div>
             )}
 
-            {/* Conflict warning */}
             {conflict&&(
               <div style={{background:"rgba(239,68,68,0.07)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:8,padding:"8px 12px"}}>
                 <div style={{fontFamily:F,fontSize:10,color:"#f87171",lineHeight:1.6}}>
@@ -1052,12 +994,11 @@ function BiasTab({market,prices}){
               </div>
             )}
 
-            {/* Signal breakdown */}
             {signals&&signals.length>0&&(
               <div style={{display:"flex",flexDirection:"column",gap:5}}>
                 {signals.map((s,i)=>{
                   const sc=s.value==="Bullish"?"#22c55e":s.value==="Bearish"?"#ef4444":"#eab308";
-                  const label=s.type==="OHLC"?"📐 OHLC Candles":s.type==="AI"?"🤖 AI Analysis":"📊 Price";
+                  const label=s.type==="OHLC"?"📐 OHLC":s.type==="AI"?"🤖 AI":"📊 Price";
                   return(
                     <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:7,padding:"6px 10px"}}>
                       <span style={{fontFamily:F,fontSize:10,color:"rgba(255,255,255,0.4)"}}>{label}</span>
@@ -1068,7 +1009,6 @@ function BiasTab({market,prices}){
               </div>
             )}
 
-            {/* Bias buttons */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
               {["Bullish","Bearish"].map(opt=>{
                 const sel=ub===opt,col=opt==="Bullish"?"#22c55e":"#ef4444";
@@ -1081,7 +1021,6 @@ function BiasTab({market,prices}){
               })}
             </div>
 
-            {/* Results */}
             {ub&&(
               <div style={{display:"flex",flexDirection:"column",gap:10,animation:"fadeup .25s ease"}}>
                 {!hasPcts?(
@@ -1105,8 +1044,8 @@ function BiasTab({market,prices}){
                     {showAlign&&(
                       <div style={{background:ub===displayBias?"rgba(34,197,94,0.05)":"rgba(239,68,68,0.05)",border:`1px solid ${ub===displayBias?"rgba(34,197,94,0.15)":"rgba(239,68,68,0.15)"}`,borderRadius:10,padding:"10px 13px",fontFamily:F,fontSize:11,color:ub===displayBias?"#4ade80":"#f87171",lineHeight:1.6}}>
                         {ub===displayBias
-                          ?`✅ Your bias aligns with ${source==="ohlc"?"real OHLC structure":source==="live"||source==="cached"?"live price":"AI"} (${displayBias}).`
-                          :`⚠ Your bias (${ub}) conflicts with ${source==="ohlc"?"real OHLC structure":source==="live"||source==="cached"?"live price":"AI"} (${displayBias}). High-risk.`}
+                          ?`✅ Aligns with ${source==="ohlc"?"real OHLC":source==="live"||source==="cached"?"live price":"AI"} (${displayBias}).`
+                          :`⚠ Your bias (${ub}) conflicts with ${source==="ohlc"?"real OHLC":source==="live"||source==="cached"?"live price":"AI"} (${displayBias}). High-risk.`}
                       </div>
                     )}
                   </>
@@ -1121,7 +1060,6 @@ function BiasTab({market,prices}){
   );
 }
 
-// ─── Diag Panel ───────────────────────────────────────────────────────
 function DiagPanel({log,onClose}){
   return(
     <div style={{position:"fixed",bottom:0,left:0,right:0,background:"rgba(4,5,8,0.99)",border:"1px solid rgba(59,130,246,0.2)",borderRadius:"18px 18px 0 0",padding:"22px 18px 36px",zIndex:400,maxHeight:"55dvh",overflow:"auto"}}>
@@ -1137,7 +1075,6 @@ function DiagPanel({log,onClose}){
   );
 }
 
-// ─── Key Screen ───────────────────────────────────────────────────────
 function KeyScreen({onSubmit}){
   const[key,setKey]=useState("");
   return(
@@ -1169,7 +1106,6 @@ function KeyScreen({onSubmit}){
   );
 }
 
-// ─── Loading Screen ───────────────────────────────────────────────────
 function LoadingScreen({log}){
   return(
     <div style={{position:"fixed",inset:0,background:"rgba(3,4,7,0.97)",zIndex:300,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:22,padding:28}}>
@@ -1184,7 +1120,6 @@ function LoadingScreen({log}){
   );
 }
 
-// ─── Root App ─────────────────────────────────────────────────────────
 export default function App(){
   const[apiKey,setApiKey]=useState(()=>{const k=store.get("sf_key");_groqKey=k;return k;});
   const[submitted,setSubmitted]=useState(()=>!!store.get("sf_key"));
