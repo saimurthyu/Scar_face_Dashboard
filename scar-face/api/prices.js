@@ -4,11 +4,10 @@
 
 const TWELVE_KEY = process.env.TWELVE_DATA_API_KEY;
 
-// Free tier Twelve Data symbols (verified working)
 const SYMBOLS = {
-  OIL:  "WTI/USD",   // WTI crude oil
-  GOLD: "XAU/USD",   // Gold spot
-  NQ:   "QQQ",       // Nasdaq 100 ETF proxy (NQ1! requires paid plan)
+  OIL:  "USOIL",     // WTI crude oil — free tier
+  GOLD: "XAU/USD",   // Gold spot — working ✅
+  NQ:   "QQQ",       // Nasdaq 100 ETF proxy — working ✅
 };
 
 // Derive market structure from last 5 daily candles
