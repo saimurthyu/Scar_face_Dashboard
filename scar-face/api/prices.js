@@ -1,5 +1,5 @@
 // api/prices.js
-// OIL  → Finnhub OANDA:WTICOUSD (real WTI ~$101)
+// OIL  → Finnhub (free, reliable, already used in app)
 // GOLD → Twelve Data XAU/USD
 // NQ   → Twelve Data QQQ
 
@@ -11,16 +11,16 @@ const TD_SYMBOLS = {
   NQ:   "QQQ",
 };
 
-// ── OHLC structure from daily candles ─────────────────────────────────
+// ── OHLC structure from 5 daily candles ──────────────────────────────
 function deriveOHLCStructure(candles) {
   if (!candles || candles.length < 3)
-    return { structure:"Unknown", detail:"Not enough candle data", rangeHigh:null, rangeLow:null };
+    return { structure:"Unknown", detail:"Not enough candle data" };
 
   const [c0,c1,c2] = candles.map(c => ({
-    o: parseFloat(c.open  ?? c.o),
-    h: parseFloat(c.high  ?? c.h),
-    l: parseFloat(c.low   ?? c.l),
-    c: parseFloat(c.close ?? c.c),
+    o:parseFloat(c.open  ?? c.o),
+    h:parseFloat(c.high  ?? c.h),
+    l:parseFloat(c.low   ?? c.l),
+    c:parseFloat(c.close ?? c.c),
   }));
 
   const body0  = c0.c - c0.o;
@@ -41,14 +41,18 @@ function deriveOHLCStructure(candles) {
 
   if ((hh && hl) || bullEngulf || (strongBull && c0.c > c1.h)) {
     structure = "Bullish";
-    detail    = hh && hl   ? "Higher highs & higher lows — uptrend structure intact"
-              : bullEngulf ? "Bullish engulfing candle — momentum shift to buyers"
-              : "Strong bullish displacement candle above prior high";
+    detail    = hh && hl
+      ? "Higher highs & higher lows — uptrend structure intact"
+      : bullEngulf
+        ? "Bullish engulfing candle — momentum shift to buyers"
+        : "Strong bullish displacement candle above prior high";
   } else if ((lh && ll) || bearEngulf || (strongBear && c0.c < c1.l)) {
     structure = "Bearish";
-    detail    = lh && ll   ? "Lower highs & lower lows — downtrend structure intact"
-              : bearEngulf ? "Bearish engulfing candle — momentum shift to sellers"
-              : "Strong bearish displacement candle below prior low";
+    detail    = lh && ll
+      ? "Lower highs & lower lows — downtrend structure intact"
+      : bearEngulf
+        ? "Bearish engulfing candle — momentum shift to sellers"
+        : "Strong bearish displacement candle below prior low";
   } else {
     detail = "No clear swing structure — price in consolidation range";
   }
@@ -60,35 +64,37 @@ function deriveOHLCStructure(candles) {
   };
 }
 
-// ── OIL via Finnhub (OANDA:WTICOUSD = real WTI crude ~$101) ──────────
+// ── OIL via Finnhub using USO ETF (tracks WTI, free tier supported) ──
 async function fetchOilFinnhub() {
   try {
     const now  = Math.floor(Date.now() / 1000);
-    const from = now - 8 * 24 * 60 * 60;
+    const from = now - 8 * 24 * 60 * 60; // 8 days back for 5+ trading days
 
-    const [qRes, cRes] = await Promise.all([
-      fetch(`https://finnhub.io/api/v1/quote?symbol=OANDA:WTICOUSD&token=${FINNHUB_KEY}`,
+    // Quote — USO = US Oil Fund ETF, tracks WTI crude
+    const [qRes, candleRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/quote?symbol=USO&token=${FINNHUB_KEY}`,
         { signal: AbortSignal.timeout(7000) }),
-      fetch(`https://finnhub.io/api/v1/forex/candle?symbol=OANDA:WTICOUSD&resolution=D&from=${from}&to=${now}&token=${FINNHUB_KEY}`,
+      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=USO&resolution=D&from=${from}&to=${now}&token=${FINNHUB_KEY}`,
         { signal: AbortSignal.timeout(7000) }),
     ]);
 
     if (!qRes.ok) throw new Error(`Finnhub quote ${qRes.status}`);
     const q = await qRes.json();
-    if (!q?.c || q.c === 0) throw new Error("No price from Finnhub WTICOUSD");
+    if (!q?.c || q.c === 0) throw new Error("No price from Finnhub USO");
 
     const price  = +parseFloat(q.c).toFixed(2);
     const prev   = q.pc || price;
     const change = +(((price - prev) / prev) * 100).toFixed(2);
 
+    // OHLC structure from candles
     let ohlcResult = { structure:"Unknown", detail:"", rangeHigh:null, rangeLow:null };
-    if (cRes.ok) {
-      const cd = await cRes.json();
+    if (candleRes.ok) {
+      const cd = await candleRes.json();
       if (cd?.s === "ok" && cd.c?.length >= 3) {
         const candles = cd.c.map((_,i) => ({
           open: cd.o[i], high: cd.h[i],
           low:  cd.l[i], close: cd.c[i],
-        })).reverse();
+        })).reverse(); // newest first
         ohlcResult = deriveOHLCStructure(candles);
       }
     }
@@ -108,6 +114,12 @@ async function fetchOilFinnhub() {
   }
 }
 
+// ── Twelve Data OHLC structure helper ────────────────────────────────
+function tdOHLC(candleData, sym) {
+  const candles = candleData[sym]?.values || [];
+  return deriveOHLCStructure(candles);
+}
+
 // ── Main handler ──────────────────────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin",  "*");
@@ -121,14 +133,15 @@ export default async function handler(req, res) {
   try {
     const symList = Object.values(TD_SYMBOLS).join(",");
 
+    // All three fetches in parallel
     const [quoteRes, candleRes, oilData] = await Promise.all([
       fetch(`https://api.twelvedata.com/quote?symbol=${symList}&apikey=${TWELVE_KEY}`),
       fetch(`https://api.twelvedata.com/time_series?symbol=${symList}&interval=1day&outputsize=6&apikey=${TWELVE_KEY}`),
       fetchOilFinnhub(),
     ]);
 
-    if (!quoteRes.ok)  throw new Error(`Quote error ${quoteRes.status}`);
-    if (!candleRes.ok) throw new Error(`Candle error ${candleRes.status}`);
+    if (!quoteRes.ok)  throw new Error(`TD quote error ${quoteRes.status}`);
+    if (!candleRes.ok) throw new Error(`TD candle error ${candleRes.status}`);
 
     const quoteData  = await quoteRes.json();
     const candleData = await candleRes.json();
@@ -144,8 +157,7 @@ export default async function handler(req, res) {
       const price  = parseFloat(q.close);
       const prev   = parseFloat(q.previous_close);
       const change = ((price - prev) / prev) * 100;
-      const candles = candleData[sym]?.values || [];
-      const { structure, detail, rangeHigh, rangeLow } = deriveOHLCStructure(candles);
+      const { structure, detail, rangeHigh, rangeLow } = tdOHLC(candleData, sym);
 
       out[asset] = {
         price:           +price.toFixed(2),
