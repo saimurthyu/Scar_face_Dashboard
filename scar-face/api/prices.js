@@ -1,13 +1,11 @@
 // api/prices.js
-// All prices from Twelve Data free tier
-// OIL  → USO  (US Oil Fund ETF — tracks WTI 1:1 direction)
-// GOLD → XAU/USD (real gold spot price)
-// NQ   → QQQ  (Nasdaq 100 ETF)
+// OIL  → Finnhub OANDA:WTICOUSD (real WTI ~$101)
+// GOLD → Twelve Data XAU/USD
+// NQ   → Twelve Data QQQ
 
 const TWELVE_KEY  = process.env.TWELVE_DATA_API_KEY;
 const FINNHUB_KEY = "d73p731r01qjjol3r9q0d73p731r01qjjol3r9qg";
 
-// GOLD + NQ from Twelve Data, OIL from Finnhub
 const TD_SYMBOLS = {
   GOLD: "XAU/USD",
   NQ:   "QQQ",
@@ -19,10 +17,10 @@ function deriveOHLCStructure(candles) {
     return { structure:"Unknown", detail:"Not enough candle data", rangeHigh:null, rangeLow:null };
 
   const [c0,c1,c2] = candles.map(c => ({
-    o: parseFloat(c.open),
-    h: parseFloat(c.high),
-    l: parseFloat(c.low),
-    c: parseFloat(c.close),
+    o: parseFloat(c.open  ?? c.o),
+    h: parseFloat(c.high  ?? c.h),
+    l: parseFloat(c.low   ?? c.l),
+    c: parseFloat(c.close ?? c.c),
   }));
 
   const body0  = c0.c - c0.o;
@@ -43,13 +41,13 @@ function deriveOHLCStructure(candles) {
 
   if ((hh && hl) || bullEngulf || (strongBull && c0.c > c1.h)) {
     structure = "Bullish";
-    detail    = hh && hl       ? "Higher highs & higher lows — uptrend structure intact"
-              : bullEngulf     ? "Bullish engulfing candle — momentum shift to buyers"
+    detail    = hh && hl   ? "Higher highs & higher lows — uptrend structure intact"
+              : bullEngulf ? "Bullish engulfing candle — momentum shift to buyers"
               : "Strong bullish displacement candle above prior high";
   } else if ((lh && ll) || bearEngulf || (strongBear && c0.c < c1.l)) {
     structure = "Bearish";
-    detail    = lh && ll       ? "Lower highs & lower lows — downtrend structure intact"
-              : bearEngulf     ? "Bearish engulfing candle — momentum shift to sellers"
+    detail    = lh && ll   ? "Lower highs & lower lows — downtrend structure intact"
+              : bearEngulf ? "Bearish engulfing candle — momentum shift to sellers"
               : "Strong bearish displacement candle below prior low";
   } else {
     detail = "No clear swing structure — price in consolidation range";
@@ -57,9 +55,57 @@ function deriveOHLCStructure(candles) {
 
   return {
     structure, detail,
-    rangeHigh: Math.max(...candles.slice(0,5).map(c => parseFloat(c.high))),
-    rangeLow:  Math.min(...candles.slice(0,5).map(c => parseFloat(c.low))),
+    rangeHigh: Math.max(...candles.slice(0,5).map(c => parseFloat(c.high ?? c.h))),
+    rangeLow:  Math.min(...candles.slice(0,5).map(c => parseFloat(c.low  ?? c.l))),
   };
+}
+
+// ── OIL via Finnhub (OANDA:WTICOUSD = real WTI crude ~$101) ──────────
+async function fetchOilFinnhub() {
+  try {
+    const now  = Math.floor(Date.now() / 1000);
+    const from = now - 8 * 24 * 60 * 60;
+
+    const [qRes, cRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/quote?symbol=OANDA:WTICOUSD&token=${FINNHUB_KEY}`,
+        { signal: AbortSignal.timeout(7000) }),
+      fetch(`https://finnhub.io/api/v1/forex/candle?symbol=OANDA:WTICOUSD&resolution=D&from=${from}&to=${now}&token=${FINNHUB_KEY}`,
+        { signal: AbortSignal.timeout(7000) }),
+    ]);
+
+    if (!qRes.ok) throw new Error(`Finnhub quote ${qRes.status}`);
+    const q = await qRes.json();
+    if (!q?.c || q.c === 0) throw new Error("No price from Finnhub WTICOUSD");
+
+    const price  = +parseFloat(q.c).toFixed(2);
+    const prev   = q.pc || price;
+    const change = +(((price - prev) / prev) * 100).toFixed(2);
+
+    let ohlcResult = { structure:"Unknown", detail:"", rangeHigh:null, rangeLow:null };
+    if (cRes.ok) {
+      const cd = await cRes.json();
+      if (cd?.s === "ok" && cd.c?.length >= 3) {
+        const candles = cd.c.map((_,i) => ({
+          open: cd.o[i], high: cd.h[i],
+          low:  cd.l[i], close: cd.c[i],
+        })).reverse();
+        ohlcResult = deriveOHLCStructure(candles);
+      }
+    }
+
+    return {
+      price, change,
+      trend:           change >= 0 ? "bullish" : "bearish",
+      live:            true,
+      fetchedAt:       Date.now(),
+      ohlcStructure:   ohlcResult.structure,
+      structureDetail: ohlcResult.detail,
+      rangeHigh:       ohlcResult.rangeHigh,
+      rangeLow:        ohlcResult.rangeLow,
+    };
+  } catch (err) {
+    return { live:false, error: err.message };
+  }
 }
 
 // ── Main handler ──────────────────────────────────────────────────────
@@ -70,12 +116,11 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   if (!TWELVE_KEY)
-    return res.status(500).json({ error: "TWELVE_DATA_API_KEY not set" });
+    return res.status(500).json({ error:"TWELVE_DATA_API_KEY not set" });
 
   try {
     const symList = Object.values(TD_SYMBOLS).join(",");
 
-    // All 3 in parallel — Finnhub for OIL, Twelve Data for GOLD+NQ
     const [quoteRes, candleRes, oilData] = await Promise.all([
       fetch(`https://api.twelvedata.com/quote?symbol=${symList}&apikey=${TWELVE_KEY}`),
       fetch(`https://api.twelvedata.com/time_series?symbol=${symList}&interval=1day&outputsize=6&apikey=${TWELVE_KEY}`),
@@ -101,6 +146,7 @@ export default async function handler(req, res) {
       const change = ((price - prev) / prev) * 100;
       const candles = candleData[sym]?.values || [];
       const { structure, detail, rangeHigh, rangeLow } = deriveOHLCStructure(candles);
+
       out[asset] = {
         price:           +price.toFixed(2),
         change:          +change.toFixed(2),
@@ -114,10 +160,10 @@ export default async function handler(req, res) {
       };
     }
 
-    res.setHeader("Cache-Control", "public, s-maxage=60, stale-while-revalidate=30");
+    res.setHeader("Cache-Control","public, s-maxage=60, stale-while-revalidate=30");
     return res.status(200).json(out);
 
-  } catch (err) {
+  } catch(err) {
     return res.status(500).json({ error: err.message });
   }
 }
