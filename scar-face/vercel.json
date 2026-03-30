@@ -1,26 +1,11 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/prices.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/$1"
-    }
+  "installCommand": "npm install",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/(.*)",     "destination": "/index.html" }
   ]
 }
