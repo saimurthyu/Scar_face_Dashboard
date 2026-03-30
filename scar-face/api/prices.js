@@ -1,133 +1,192 @@
 // api/prices.js
-// Vercel serverless — Twelve Data free tier (800 calls/day)
-// Fetches quote + last 5 daily candles to derive real OHLC structure
+// OIL  → Finnhub (free, reliable, already used in app)
+// GOLD → Twelve Data XAU/USD
+// NQ   → Twelve Data QQQ
 
-const TWELVE_KEY = process.env.TWELVE_DATA_API_KEY;
+const TWELVE_KEY  = process.env.TWELVE_DATA_API_KEY;
+const FINNHUB_KEY = "d73p731r01qjjol3r9q0d73p731r01qjjol3r9qg";
 
-const SYMBOLS = {
-  OIL:  "USOIL",     // WTI crude oil — free tier
-  GOLD: "XAU/USD",   // Gold spot — working ✅
-  NQ:   "QQQ",       // Nasdaq 100 ETF proxy — working ✅
+const TD_SYMBOLS = {
+  GOLD: "XAU/USD",
+  NQ:   "QQQ",
 };
 
-// Derive market structure from last 5 daily candles
+// ── OHLC structure from 5 daily candles ──────────────────────────────
 function deriveOHLCStructure(candles) {
-  if (!candles || candles.length < 3) return { structure: "Unknown", detail: "Not enough candle data" };
+  if (!candles || candles.length < 3)
+    return { structure:"Unknown", detail:"Not enough candle data" };
 
-  // candles[0] = most recent, candles[4] = oldest
-  const [c0, c1, c2] = candles.map(c => ({
-    o: parseFloat(c.open),
-    h: parseFloat(c.high),
-    l: parseFloat(c.low),
-    c: parseFloat(c.close),
+  const [c0,c1,c2] = candles.map(c => ({
+    o:parseFloat(c.open  ?? c.o),
+    h:parseFloat(c.high  ?? c.h),
+    l:parseFloat(c.low   ?? c.l),
+    c:parseFloat(c.close ?? c.c),
   }));
 
   const body0  = c0.c - c0.o;
   const body1  = c1.c - c1.o;
   const range0 = c0.h - c0.l;
 
-  // Higher highs / higher lows = bullish structure
   const hh = c0.h > c1.h && c1.h > c2.h;
-  const hl  = c0.l > c1.l && c1.l > c2.l;
-  // Lower highs / lower lows = bearish structure
-  const lh  = c0.h < c1.h && c1.h < c2.h;
-  const ll  = c0.l < c1.l && c1.l < c2.l;
+  const hl = c0.l > c1.l && c1.l > c2.l;
+  const lh = c0.h < c1.h && c1.h < c2.h;
+  const ll = c0.l < c1.l && c1.l < c2.l;
 
-  // Bullish engulfing
   const bullEngulf = body1 < 0 && body0 > 0 && c0.c > c1.o && c0.o < c1.c;
-  // Bearish engulfing
   const bearEngulf = body1 > 0 && body0 < 0 && c0.c < c1.o && c0.o > c1.c;
-
-  // Strong bullish candle (body > 60% of range, closed green)
   const strongBull = body0 > 0 && range0 > 0 && (body0 / range0) > 0.6;
-  // Strong bearish candle
   const strongBear = body0 < 0 && range0 > 0 && (Math.abs(body0) / range0) > 0.6;
 
-  let structure = "Neutral";
-  let detail    = "";
+  let structure = "Neutral", detail = "";
 
   if ((hh && hl) || bullEngulf || (strongBull && c0.c > c1.h)) {
     structure = "Bullish";
-    if (hh && hl)    detail = "Higher highs & higher lows — uptrend structure intact";
-    else if (bullEngulf) detail = "Bullish engulfing candle — momentum shift to buyers";
-    else              detail = "Strong bullish displacement candle above prior high";
+    detail    = hh && hl
+      ? "Higher highs & higher lows — uptrend structure intact"
+      : bullEngulf
+        ? "Bullish engulfing candle — momentum shift to buyers"
+        : "Strong bullish displacement candle above prior high";
   } else if ((lh && ll) || bearEngulf || (strongBear && c0.c < c1.l)) {
     structure = "Bearish";
-    if (lh && ll)    detail = "Lower highs & lower lows — downtrend structure intact";
-    else if (bearEngulf) detail = "Bearish engulfing candle — momentum shift to sellers";
-    else              detail = "Strong bearish displacement candle below prior low";
+    detail    = lh && ll
+      ? "Lower highs & lower lows — downtrend structure intact"
+      : bearEngulf
+        ? "Bearish engulfing candle — momentum shift to sellers"
+        : "Strong bearish displacement candle below prior low";
   } else {
-    structure = "Neutral";
-    detail    = "No clear swing structure — price in consolidation range";
+    detail = "No clear swing structure — price in consolidation range";
   }
 
   return {
-    structure,
-    detail,
-    rangeHigh: Math.max(...candles.slice(0, 5).map(c => parseFloat(c.high))),
-    rangeLow:  Math.min(...candles.slice(0, 5).map(c => parseFloat(c.low))),
+    structure, detail,
+    rangeHigh: Math.max(...candles.slice(0,5).map(c => parseFloat(c.high ?? c.h))),
+    rangeLow:  Math.min(...candles.slice(0,5).map(c => parseFloat(c.low  ?? c.l))),
   };
 }
 
+// ── OIL via Finnhub ───────────────────────────────────────────────────
+// Finnhub free tier supports US futures — CL1 = WTI front month
+async function fetchOilFinnhub() {
+  try {
+    const now    = Math.floor(Date.now() / 1000);
+    const from   = now - 7 * 24 * 60 * 60; // 7 days ago
+
+    // Current quote
+    const qRes = await fetch(
+      `https://finnhub.io/api/v1/quote?symbol=CL1&token=${FINNHUB_KEY}`,
+      { signal: AbortSignal.timeout(7000) }
+    );
+    if (!qRes.ok) throw new Error(`Finnhub quote ${qRes.status}`);
+    const q = await qRes.json();
+    if (!q?.c || q.c === 0) throw new Error("No price from Finnhub");
+
+    const price  = +parseFloat(q.c).toFixed(2);
+    const prev   = q.pc || price;
+    const change = +(((price - prev) / prev) * 100).toFixed(2);
+
+    // Daily candles for OHLC structure (last 6 days)
+    const cRes = await fetch(
+      `https://finnhub.io/api/v1/indicator?symbol=CL1&resolution=D&from=${from}&to=${now}&indicator=obv&token=${FINNHUB_KEY}`,
+      { signal: AbortSignal.timeout(7000) }
+    );
+
+    // Use simpler candle endpoint
+    const candleRes = await fetch(
+      `https://finnhub.io/api/v1/stock/candle?symbol=CL1&resolution=D&from=${from}&to=${now}&token=${FINNHUB_KEY}`,
+      { signal: AbortSignal.timeout(7000) }
+    );
+
+    let ohlcResult = { structure:"Unknown", detail:"", rangeHigh: null, rangeLow: null };
+
+    if (candleRes.ok) {
+      const cd = await candleRes.json();
+      if (cd?.s === "ok" && cd.c?.length >= 3) {
+        // Build candles array newest first
+        const candles = cd.c.map((_,i) => ({
+          open:  cd.o[i], high: cd.h[i],
+          low:   cd.l[i], close: cd.c[i],
+        })).reverse();
+        ohlcResult = deriveOHLCStructure(candles);
+      }
+    }
+
+    return {
+      price, change,
+      trend:           change >= 0 ? "bullish" : "bearish",
+      live:            true,
+      fetchedAt:       Date.now(),
+      ohlcStructure:   ohlcResult.structure,
+      structureDetail: ohlcResult.detail,
+      rangeHigh:       ohlcResult.rangeHigh,
+      rangeLow:        ohlcResult.rangeLow,
+    };
+  } catch (err) {
+    return { live:false, error: err.message };
+  }
+}
+
+// ── Twelve Data OHLC structure helper ────────────────────────────────
+function tdOHLC(candleData, sym) {
+  const candles = candleData[sym]?.values || [];
+  return deriveOHLCStructure(candles);
+}
+
+// ── Main handler ──────────────────────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  if (!TWELVE_KEY) {
-    return res.status(500).json({ error: "TWELVE_DATA_API_KEY not set" });
-  }
+  if (!TWELVE_KEY)
+    return res.status(500).json({ error:"TWELVE_DATA_API_KEY not set" });
 
   try {
-    const symbolList = Object.values(SYMBOLS).join(",");
+    const symList = Object.values(TD_SYMBOLS).join(",");
 
-    // Fetch quote + time_series (last 5 daily candles) in parallel
-    const [quoteRes, candleRes] = await Promise.all([
-      fetch(`https://api.twelvedata.com/quote?symbol=${symbolList}&apikey=${TWELVE_KEY}`),
-      fetch(`https://api.twelvedata.com/time_series?symbol=${symbolList}&interval=1day&outputsize=5&apikey=${TWELVE_KEY}`),
+    // All three fetches in parallel
+    const [quoteRes, candleRes, oilData] = await Promise.all([
+      fetch(`https://api.twelvedata.com/quote?symbol=${symList}&apikey=${TWELVE_KEY}`),
+      fetch(`https://api.twelvedata.com/time_series?symbol=${symList}&interval=1day&outputsize=6&apikey=${TWELVE_KEY}`),
+      fetchOilFinnhub(),
     ]);
 
-    if (!quoteRes.ok)  throw new Error(`Quote error ${quoteRes.status}`);
-    if (!candleRes.ok) throw new Error(`Candle error ${candleRes.status}`);
+    if (!quoteRes.ok)  throw new Error(`TD quote error ${quoteRes.status}`);
+    if (!candleRes.ok) throw new Error(`TD candle error ${candleRes.status}`);
 
     const quoteData  = await quoteRes.json();
     const candleData = await candleRes.json();
 
-    const out = {};
+    const out = { OIL: oilData };
 
-    for (const [asset, sym] of Object.entries(SYMBOLS)) {
+    for (const [asset, sym] of Object.entries(TD_SYMBOLS)) {
       const q = quoteData[sym];
       if (!q || q.status === "error") {
-        out[asset] = { live: false, error: q?.message || "no quote data" };
+        out[asset] = { live:false, error: q?.message || "no data" };
         continue;
       }
-
       const price  = parseFloat(q.close);
       const prev   = parseFloat(q.previous_close);
       const change = ((price - prev) / prev) * 100;
-
-      // OHLC structure from candles
-      const candleSeries = candleData[sym]?.values || [];
-      const { structure, detail, rangeHigh, rangeLow } = deriveOHLCStructure(candleSeries);
+      const { structure, detail, rangeHigh, rangeLow } = tdOHLC(candleData, sym);
 
       out[asset] = {
-        price:          +price.toFixed(2),
-        change:         +change.toFixed(2),
-        trend:          change >= 0 ? "bullish" : "bearish",
-        live:           true,
-        fetchedAt:      Date.now(),
-        ohlcStructure:  structure,   // "Bullish" | "Bearish" | "Neutral" | "Unknown"
+        price:           +price.toFixed(2),
+        change:          +change.toFixed(2),
+        trend:           change >= 0 ? "bullish" : "bearish",
+        live:            true,
+        fetchedAt:       Date.now(),
+        ohlcStructure:   structure,
         structureDetail: detail,
         rangeHigh,
         rangeLow,
       };
     }
 
-    res.setHeader("Cache-Control", "public, s-maxage=60, stale-while-revalidate=30");
+    res.setHeader("Cache-Control","public, s-maxage=60, stale-while-revalidate=30");
     return res.status(200).json(out);
 
-  } catch (err) {
+  } catch(err) {
     return res.status(500).json({ error: err.message });
   }
 }
