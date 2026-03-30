@@ -109,28 +109,37 @@ async function fetchJSON(url,opts={},ms=9000){
 }
 
 function resolveEffectiveBias(aiBias, priceData){
-  const hasPrice = (priceData?.live||priceData?.cached) && priceData?.trend!=null;
-  const ohlcStr  = priceData?.ohlcStructure;
-  const hasOHLC  = ohlcStr && ohlcStr!=="Unknown" && ohlcStr!=="Neutral";
-  const moveStrong = Math.abs(priceData?.change||0)>=1.5;
+  // Only trust price data that came from a real live/cached market feed (not Groq estimates)
+  const isRealPrice = priceData?.live===true || priceData?.cached===true;
+  const hasOHLC  = isRealPrice && priceData?.ohlcStructure &&
+                   priceData.ohlcStructure!=="Unknown" && priceData.ohlcStructure!=="Neutral";
+  const moveStrong = isRealPrice && Math.abs(priceData?.change||0)>=1.5;
 
   const signals = [];
-  if(hasOHLC) signals.push({type:"OHLC", value:ohlcStr});
+  if(hasOHLC) signals.push({type:"OHLC", value:priceData.ohlcStructure});
   if(aiBias && aiBias!=="Neutral") signals.push({type:"AI", value:aiBias});
-  if(hasPrice && moveStrong) signals.push({type:"PRICE", value:priceData.trend==="bullish"?"Bullish":"Bearish"});
+  if(isRealPrice && moveStrong) signals.push({type:"PRICE", value:priceData.trend==="bullish"?"Bullish":"Bearish"});
 
+  // Priority: real OHLC > strong live price move > AI suggestion
+  // If no real price data at all → AI bias is the only source, always use it
   let finalBias = null;
   let source    = "none";
-  if(hasOHLC){ finalBias=ohlcStr; source="ohlc"; }
-  else if(hasPrice && moveStrong){ finalBias=priceData.trend==="bullish"?"Bullish":"Bearish"; source="live"; }
-  else if(aiBias && aiBias!=="Neutral"){ finalBias=aiBias; source="ai"; }
+  if(hasOHLC){
+    finalBias=priceData.ohlcStructure; source="ohlc";
+  } else if(isRealPrice && moveStrong){
+    finalBias=priceData.trend==="bullish"?"Bullish":"Bearish"; source="live";
+  } else if(aiBias && aiBias!=="Neutral"){
+    finalBias=aiBias; source="ai";
+  } else if(aiBias){
+    finalBias=aiBias; source="ai"; // even Neutral AI bias shows
+  }
 
   if(!finalBias) return{bias:null,overridden:false,source:"none",confidence:"LOW",conflict:false,signals:[]};
 
-  const bullish = signals.filter(s=>s.value==="Bullish").length;
-  const bearish = signals.filter(s=>s.value==="Bearish").length;
-  const total   = signals.length;
-  const majority= Math.max(bullish,bearish);
+  const bullCt = signals.filter(s=>s.value==="Bullish").length;
+  const bearCt = signals.filter(s=>s.value==="Bearish").length;
+  const total  = signals.length;
+  const majority=Math.max(bullCt,bearCt);
   let confidence="LOW";
   if(total>=3 && majority===3) confidence="HIGH";
   else if(total>=2 && majority===total) confidence="HIGH";
@@ -138,7 +147,7 @@ function resolveEffectiveBias(aiBias, priceData){
   else confidence="LOW";
 
   const conflict   = signals.length>1 && signals.some(s=>s.value!==finalBias);
-  const overridden = aiBias && aiBias!=="Neutral" && finalBias!==aiBias;
+  const overridden = isRealPrice && aiBias && aiBias!=="Neutral" && finalBias!==aiBias;
 
   return{bias:finalBias,overridden,source,confidence,conflict,signals};
 }
@@ -148,8 +157,10 @@ const _cache    = {};
 
 async function fetchLivePrices(){
   const now=Date.now();
+
+  // Primary: Vercel /api/prices — returns price + OHLC structure from Twelve Data
   try{
-    const r=await fetchJSON("/api/prices",{},8000);
+    const r=await fetchJSON("/api/prices",{},10000);
     if(r.ok){
       const data=await r.json();
       const allLive=["OIL","GOLD","NQ"].every(a=>data[a]?.live);
@@ -159,43 +170,15 @@ async function fetchLivePrices(){
       }
     }
   }catch{}
-  try{
-    const today=new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"});
-    const r=await fetch("https://api.groq.com/openai/v1/chat/completions",{
-      method:"POST",
-      headers:{"Content-Type":"application/json",Authorization:`Bearer ${_groqKey}`},
-      body:JSON.stringify({
-        model:GROQ_MODEL,temperature:0,max_tokens:200,
-        response_format:{type:"json_object"},
-        messages:[
-          {role:"system",content:`Financial assistant. Today is ${today}. Return ONLY valid JSON.`},
-          {role:"user",content:`Current approximate prices for WTI Crude Oil (CL), Gold (GC), Nasdaq 100 (NQ) futures? Return ONLY: {"OIL":{"price":100.93,"change":-0.23},"GOLD":{"price":4547.0,"change":2.59},"NQ":{"price":23132.0,"change":-1.93}}`},
-        ],
-      }),
-    });
-    if(r.ok){
-      const body=await r.json();
-      const raw=body?.choices?.[0]?.message?.content||"";
-      const match=raw.replace(/```json|```/g,"").trim().match(/\{[\s\S]*\}/);
-      if(match){
-        const parsed=JSON.parse(match[0]);
-        const out={};
-        for(const a of ["OIL","GOLD","NQ"]){
-          const d=parsed[a];
-          if(d?.price!=null&&d?.change!=null){
-            const chg=parseFloat(d.change);
-            out[a]={price:+parseFloat(d.price).toFixed(2),change:+chg.toFixed(2),trend:chg>=0?"bullish":"bearish",live:true,fetchedAt:now};
-            _cache[a]=out[a];
-          }
-        }
-        if(Object.keys(out).length===3)return out;
-      }
-    }
-  }catch{}
+
+  // Fallback: serve from cache (preserves ohlcStructure from last successful fetch)
+  // No Groq/Yahoo fallback — they don't provide OHLC candle data
   const out={};
   for(const a of ["OIL","GOLD","NQ"]){
     const c=_cache[a];
-    out[a]=c&&(now-c.fetchedAt)<CACHE_TTL?{...c,live:false,cached:true}:{price:null,change:null,trend:null,live:false};
+    out[a]=c&&(now-c.fetchedAt)<CACHE_TTL
+      ?{...c,live:false,cached:true}
+      :{price:null,change:null,trend:null,ohlcStructure:null,live:false};
   }
   return out;
 }
