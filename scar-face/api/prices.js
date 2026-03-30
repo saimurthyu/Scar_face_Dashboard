@@ -64,48 +64,37 @@ function deriveOHLCStructure(candles) {
   };
 }
 
-// ── OIL via Finnhub ───────────────────────────────────────────────────
-// Finnhub free tier supports US futures — CL1 = WTI front month
+// ── OIL via Finnhub using USO ETF (tracks WTI, free tier supported) ──
 async function fetchOilFinnhub() {
   try {
-    const now    = Math.floor(Date.now() / 1000);
-    const from   = now - 7 * 24 * 60 * 60; // 7 days ago
+    const now  = Math.floor(Date.now() / 1000);
+    const from = now - 8 * 24 * 60 * 60; // 8 days back for 5+ trading days
 
-    // Current quote
-    const qRes = await fetch(
-      `https://finnhub.io/api/v1/quote?symbol=CL1&token=${FINNHUB_KEY}`,
-      { signal: AbortSignal.timeout(7000) }
-    );
+    // Quote — USO = US Oil Fund ETF, tracks WTI crude
+    const [qRes, candleRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/quote?symbol=USO&token=${FINNHUB_KEY}`,
+        { signal: AbortSignal.timeout(7000) }),
+      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=USO&resolution=D&from=${from}&to=${now}&token=${FINNHUB_KEY}`,
+        { signal: AbortSignal.timeout(7000) }),
+    ]);
+
     if (!qRes.ok) throw new Error(`Finnhub quote ${qRes.status}`);
     const q = await qRes.json();
-    if (!q?.c || q.c === 0) throw new Error("No price from Finnhub");
+    if (!q?.c || q.c === 0) throw new Error("No price from Finnhub USO");
 
     const price  = +parseFloat(q.c).toFixed(2);
     const prev   = q.pc || price;
     const change = +(((price - prev) / prev) * 100).toFixed(2);
 
-    // Daily candles for OHLC structure (last 6 days)
-    const cRes = await fetch(
-      `https://finnhub.io/api/v1/indicator?symbol=CL1&resolution=D&from=${from}&to=${now}&indicator=obv&token=${FINNHUB_KEY}`,
-      { signal: AbortSignal.timeout(7000) }
-    );
-
-    // Use simpler candle endpoint
-    const candleRes = await fetch(
-      `https://finnhub.io/api/v1/stock/candle?symbol=CL1&resolution=D&from=${from}&to=${now}&token=${FINNHUB_KEY}`,
-      { signal: AbortSignal.timeout(7000) }
-    );
-
-    let ohlcResult = { structure:"Unknown", detail:"", rangeHigh: null, rangeLow: null };
-
+    // OHLC structure from candles
+    let ohlcResult = { structure:"Unknown", detail:"", rangeHigh:null, rangeLow:null };
     if (candleRes.ok) {
       const cd = await candleRes.json();
       if (cd?.s === "ok" && cd.c?.length >= 3) {
-        // Build candles array newest first
         const candles = cd.c.map((_,i) => ({
-          open:  cd.o[i], high: cd.h[i],
-          low:   cd.l[i], close: cd.c[i],
-        })).reverse();
+          open: cd.o[i], high: cd.h[i],
+          low:  cd.l[i], close: cd.c[i],
+        })).reverse(); // newest first
         ohlcResult = deriveOHLCStructure(candles);
       }
     }
