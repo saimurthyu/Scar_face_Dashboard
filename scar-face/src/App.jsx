@@ -106,17 +106,50 @@ async function fetchJSON(url,opts={},ms=9000){
 }
 
 // ─── resolveEffectiveBias ─────────────────────────────────────────────
-function resolveEffectiveBias(aiBias,priceData){
-  const hasPrice=(priceData?.live||priceData?.cached)&&priceData?.trend!=null;
-  if(!hasPrice){
-    if(!aiBias||aiBias==="Neutral")return{bias:null,overridden:false,source:"none"};
-    return{bias:aiBias,overridden:false,source:"ai"};
+// Combines AI bias + real OHLC structure + live price momentum
+// Returns confidence level and any conflicts for the UI to display
+function resolveEffectiveBias(aiBias, priceData){
+  const hasPrice  = (priceData?.live || priceData?.cached) && priceData?.trend != null;
+  const ohlcStr   = priceData?.ohlcStructure; // "Bullish" | "Bearish" | "Neutral" | "Unknown"
+  const hasOHLC   = ohlcStr && ohlcStr !== "Unknown";
+  const moveStrong = Math.abs(priceData?.change || 0) >= 1.5;
+  const src        = priceData?.cached ? "cached" : "live";
+
+  // Build array of signals
+  const signals = [];
+  if(aiBias && aiBias !== "Neutral") signals.push({ type:"AI",   value: aiBias });
+  if(hasOHLC && ohlcStr !== "Neutral") signals.push({ type:"OHLC", value: ohlcStr });
+  if(hasPrice && moveStrong) signals.push({ type:"PRICE", value: priceData.trend === "bullish" ? "Bullish" : "Bearish" });
+
+  if(signals.length === 0){
+    return { bias:null, overridden:false, source:"none", confidence:"LOW", conflict:false, signals:[] };
   }
-  const priceBias=priceData.trend==="bullish"?"Bullish":"Bearish";
-  const src=priceData?.cached?"cached":"live";
-  if(!aiBias||aiBias==="Neutral")return{bias:priceBias,overridden:false,source:src};
-  if(aiBias!==priceBias)return{bias:priceBias,overridden:true,source:src};
-  return{bias:aiBias,overridden:false,source:"ai"};
+
+  // Count agreements
+  const bullCount = signals.filter(s => s.value === "Bullish").length;
+  const bearCount = signals.filter(s => s.value === "Bearish").length;
+
+  // Determine final bias — majority wins
+  let finalBias = bullCount > bearCount ? "Bullish" : bearCount > bullCount ? "Bearish" : (aiBias || ohlcStr || "Neutral");
+
+  // Determine confidence based on agreement
+  let confidence = "LOW";
+  const total = signals.length;
+  const majority = Math.max(bullCount, bearCount);
+
+  if(total >= 3 && majority === 3) confidence = "HIGH";       // all 3 agree
+  else if(total >= 2 && majority === total) confidence = "HIGH";  // 2 present and agree
+  else if(total >= 2 && majority >= 2) confidence = "MEDIUM";    // 2 of 3 agree
+  else confidence = "LOW";                                        // only 1 signal or split
+
+  // Detect conflict — any signal disagrees with final bias
+  const conflict = signals.some(s => s.value !== finalBias);
+
+  // Determine primary source label
+  const primarySource = hasOHLC ? "ohlc" : hasPrice ? src : "ai";
+  const overridden    = aiBias && aiBias !== "Neutral" && finalBias !== aiBias;
+
+  return { bias:finalBias, overridden, source:primarySource, confidence, conflict, signals };
 }
 
 // ─── Price cache — 5 min TTL ──────────────────────────────────────────
@@ -319,7 +352,7 @@ async function analyzeMarket({fg,momentum,news,apiKey,prices}){
     if((!p?.live&&!p?.cached)||p.trend==null)return null;
     return`${a.id} is ${p.change>0?"+":""}${p.change}% — bias MUST be "${p.trend==="bullish"?"Bullish":"Bearish"}"`;
   }).filter(Boolean);
-  const hardRule=constraints.length>0?`\n\nHARD PRICE RULES:\n${constraints.join("\n")}\nNever set bias opposite to these.\n`:"";
+  const hardRule=constraints.length>0?`\n\nHARD PRICE RULES (never violate):\n${constraints.join("\n")}\n`:"";
   const hint=id=>{
     const p=prices?.[id];
     if((p?.live||p?.cached)&&p.trend)return p.trend==="bullish"?"Bullish":"Bearish";
@@ -327,9 +360,100 @@ async function analyzeMarket({fg,momentum,news,apiKey,prices}){
     if(m?.live&&m.trend)return m.trend==="rising"?"Bullish":"Bearish";
     return"Bearish";
   };
+
+  // Build price context for key levels — give AI the actual current price
+  const priceContext=ASSETS.map(a=>{
+    const p=prices?.[a.id];
+    if(!p?.price)return`${a.id}: price unknown`;
+    return`${a.id}: current price ${p.price} (${p.change>0?"+":""}${p.change}%)`;
+  }).join(", ");
+
   return groq(apiKey,[
-    {role:"system",content:"You are a Wall Street ICT trading analyst. Return ONLY valid JSON. No markdown. Respect HARD PRICE RULES — never use Neutral for assets with live price data."},
-    {role:"user",content:`Analyze OIL, GOLD, NQ futures.${hardRule}\nFear & Greed: ${fg.value}/100 (${fg.label})\nMomentum: ${momText}\nNews:\n${newsText}\n\nKILLZONES: OIL/GOLD=London 2-5AM or NY AM 7-10AM EST | NQ=NY Open 9:30-11AM or NY PM 1-3PM EST\n\nBIAS (must match price rules):\nOIL="${hint("OIL")}" GOLD="${hint("GOLD")}" NQ="${hint("NQ")}"\n\nJSON:\n{"regime":"<RISK-ON|RISK-OFF|STAGFLATION|UNCERTAINTY|NEUTRAL>","regime_reason":"<sentence>","correlation_warning":"<sentence or null>","dxy_bias":"<Bullish|Bearish|Neutral>","dxy_reason":"<sentence>","session_note":"<sentence>","smart_money_note":"<sentence>","assets":{"OIL":{"bias":"${hint("OIL")}","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":30,"bullish_trap_pct":70,"bearish_real_pct":70,"bearish_trap_pct":30},"GOLD":{"bias":"${hint("GOLD")}","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":30,"bullish_trap_pct":70,"bearish_real_pct":70,"bearish_trap_pct":30},"NQ":{"bias":"${hint("NQ")}","move_type":"<3-5 words>","approach":"<sentence>","sentiment_edge":"<Bullish|Bearish>","crowd_vs_smart":"<With crowd|Against crowd>","smt_signal":"<Confirming|Diverging|Neutral>","smt_note":"<sentence>","dxy_impact":"<Headwind|Tailwind|Neutral>","killzone_edge":"<session>","key_level_bull":"<price>","key_level_bear":"<price>","bullish_real_pct":30,"bullish_trap_pct":70,"bearish_real_pct":70,"bearish_trap_pct":30}},"pair_trade":"<sentence>","risk_event":"<sentence>","macro_summary":"<two sentences>"}`},
+    {role:"system",content:`You are a Wall Street ICT trading analyst. Return ONLY valid JSON. No markdown.
+RULES:
+1. bias fields MUST match HARD PRICE RULES exactly
+2. NEVER use "Neutral" for bias on any asset that has a live price
+3. key_level_bull and key_level_bear MUST be real price levels based on current price context — NOT placeholder numbers
+4. bullish_real_pct + bullish_trap_pct MUST equal 100. bearish_real_pct + bearish_trap_pct MUST equal 100
+5. All percentage values must be real analysis between 0-100, never all 30/70`},
+    {role:"user",content:`Analyze OIL, GOLD, NQ futures right now.${hardRule}
+
+Current prices: ${priceContext}
+Fear & Greed: ${fg.value}/100 (${fg.label})
+Momentum: ${momText}
+News:\n${newsText}
+
+KILLZONES: OIL/GOLD=London 2-5AM or NY AM 7-10AM EST | NQ=NY Open 9:30-11AM or NY PM 1-3PM EST
+
+BIAS MUST BE:
+OIL="${hint("OIL")}" GOLD="${hint("GOLD")}" NQ="${hint("NQ")}"
+
+Return this JSON with REAL values (no placeholders, no identical numbers across assets):
+{
+  "regime": "UNCERTAINTY",
+  "regime_reason": "one sentence",
+  "correlation_warning": "one sentence or null",
+  "dxy_bias": "Bearish",
+  "dxy_reason": "one sentence",
+  "session_note": "one sentence",
+  "smart_money_note": "one sentence",
+  "assets": {
+    "OIL": {
+      "bias": "${hint("OIL")}",
+      "move_type": "3-5 word description",
+      "approach": "entry stop target sentence",
+      "sentiment_edge": "${hint("OIL")}",
+      "crowd_vs_smart": "With crowd",
+      "smt_signal": "Confirming",
+      "smt_note": "one sentence",
+      "dxy_impact": "Headwind",
+      "killzone_edge": "London Open",
+      "key_level_bull": "calculate based on OIL current price",
+      "key_level_bear": "calculate based on OIL current price",
+      "bullish_real_pct": 45,
+      "bullish_trap_pct": 55,
+      "bearish_real_pct": 65,
+      "bearish_trap_pct": 35
+    },
+    "GOLD": {
+      "bias": "${hint("GOLD")}",
+      "move_type": "3-5 word description",
+      "approach": "entry stop target sentence",
+      "sentiment_edge": "${hint("GOLD")}",
+      "crowd_vs_smart": "With crowd",
+      "smt_signal": "Confirming",
+      "smt_note": "one sentence",
+      "dxy_impact": "Headwind",
+      "killzone_edge": "London Open",
+      "key_level_bull": "calculate based on GOLD current price",
+      "key_level_bear": "calculate based on GOLD current price",
+      "bullish_real_pct": 55,
+      "bullish_trap_pct": 45,
+      "bearish_real_pct": 60,
+      "bearish_trap_pct": 40
+    },
+    "NQ": {
+      "bias": "${hint("NQ")}",
+      "move_type": "3-5 word description",
+      "approach": "entry stop target sentence",
+      "sentiment_edge": "${hint("NQ")}",
+      "crowd_vs_smart": "Against crowd",
+      "smt_signal": "Diverging",
+      "smt_note": "one sentence",
+      "dxy_impact": "Neutral",
+      "killzone_edge": "NY Open",
+      "key_level_bull": "calculate based on NQ current price",
+      "key_level_bear": "calculate based on NQ current price",
+      "bullish_real_pct": 40,
+      "bullish_trap_pct": 60,
+      "bearish_real_pct": 70,
+      "bearish_trap_pct": 30
+    }
+  },
+  "pair_trade": "one sentence",
+  "risk_event": "one sentence",
+  "macro_summary": "two sentences"
+}`},
   ],1800);
 }
 
@@ -411,16 +535,20 @@ function useMarket(apiKey){
       const market=await analyzeMarket({fg,momentum,news,apiKey,prices});
       addLog("✅ Done.");
 
+      // Post-process: only force bias correction on STRONG moves (>1.5%)
+      // Small moves are noise — respect AI structure analysis
       const fixed={...market,assets:{...market.assets}};
       for(const a of ASSETS){
         const asset=fixed.assets?.[a.id];
         if(!asset)continue;
         const p=prices[a.id];
         if(!p?.live&&!p?.cached)continue;
+        const moveStrong=Math.abs(p.change||0)>=1.5;
+        if(!moveStrong)continue; // trust AI for small moves
         const liveDir=p.trend==="bullish"?"Bullish":"Bearish";
         if(!asset.bias||asset.bias==="Neutral"||asset.bias!==liveDir){
           fixed.assets[a.id]={...asset,bias:liveDir};
-          addLog(`⚡ Fixed ${a.id} bias → ${liveDir}`);
+          addLog(`⚡ Strong move — fixed ${a.id} bias → ${liveDir} (${p.change}%)`);
         }
       }
 
@@ -566,7 +694,7 @@ function FearGauge({value,label,live,source}){
 // ─── DXY Strip ────────────────────────────────────────────────────────
 function DXYStrip({data}){
   if(!data?.dxy_bias)return null;
-  const b=data.dxy_bias,color=b==="Bullish"?"#ef4444":b==="Bearish"?"#22c55e":"#eab308";
+  const b=data.dxy_bias, color=b==="Bullish"?"#22c55e":b==="Bearish"?"#ef4444":"#eab308";
   return(
     <div style={{background:"rgba(6,8,16,0.97)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:14,padding:"12px 16px",display:"flex",alignItems:"center",gap:14}}>
       <span style={{fontFamily:F,fontSize:10,letterSpacing:2,color:"rgba(255,255,255,0.25)",flexShrink:0}}>DXY</span>
@@ -642,11 +770,29 @@ function AssetCard({asset,data,price}){
           )}
         </div>
         <div style={{marginTop:10}}><KZBadge assetId={asset.id}/></div>
-        {data&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10}}><span style={{fontFamily:F,fontSize:12,color:asset.color}}>{data.move_type}</span><span style={{fontSize:18,color:"rgba(255,255,255,0.18)"}}>{open?"▲":"▼"}</span></div>}
+        {data&&(
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10}}>
+            <span style={{fontFamily:F,fontSize:12,color:asset.color}}>{data.move_type}</span>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              {data.confidence&&(
+                <span style={{fontFamily:F,fontSize:9,letterSpacing:1,color:data.confidence==="High"?"#22c55e":data.confidence==="Medium"?"#eab308":"#64748b",background:data.confidence==="High"?"rgba(34,197,94,0.1)":data.confidence==="Medium"?"rgba(234,179,8,0.1)":"rgba(100,116,139,0.1)",border:`1px solid ${data.confidence==="High"?"rgba(34,197,94,0.3)":data.confidence==="Medium"?"rgba(234,179,8,0.3)":"rgba(100,116,139,0.3)"}`,borderRadius:6,padding:"2px 7px"}}>
+                  {data.confidence.toUpperCase()} CONF
+                </span>
+              )}
+              <span style={{fontSize:18,color:"rgba(255,255,255,0.18)"}}>{open?"▲":"▼"}</span>
+            </div>
+          </div>
+        )}
       </button>
       {open&&data&&(
         <div style={{padding:"0 16px 18px",display:"flex",flexDirection:"column",gap:12,animation:"fadeup .22s ease"}}>
-          {overridden&&<div style={{background:"rgba(249,115,22,0.06)",border:"1px solid rgba(249,115,22,0.2)",borderRadius:10,padding:"9px 13px",fontFamily:F,fontSize:11,color:"rgba(255,255,255,0.45)",lineHeight:1.6}}>⚠ Live price is <span style={{color:priceColor}}>{price.trend.toUpperCase()}</span> — overridden from AI ({data?.bias}). Hit ↻ to refresh.</div>}
+          {overridden&&<div style={{background:"rgba(249,115,22,0.06)",border:"1px solid rgba(249,115,22,0.2)",borderRadius:10,padding:"9px 13px",fontFamily:F,fontSize:11,color:"rgba(255,255,255,0.45)",lineHeight:1.6}}>⚠ Strong move detected — live price overrode AI structure bias ({data?.bias}). Hit ↻ to refresh.</div>}
+          {data.structure&&(
+            <div style={{background:"rgba(59,130,246,0.05)",border:"1px solid rgba(59,130,246,0.15)",borderLeft:"3px solid #3b82f6",borderRadius:10,padding:"10px 13px"}}>
+              <div style={{fontFamily:F,fontSize:9,letterSpacing:2,color:"#60a5fa",marginBottom:4}}>📐 MARKET STRUCTURE</div>
+              <div style={{fontFamily:F,fontSize:12,color:"rgba(255,255,255,0.55)",lineHeight:1.6}}>{data.structure}</div>
+            </div>
+          )}
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
             {[{l:"SENTIMENT",v:data.sentiment_edge},{l:"VS CROWD",v:data.crowd_vs_smart},{l:"BULL LEVEL",v:data.key_level_bull},{l:"BEAR LEVEL",v:data.key_level_bear}].map(f=>{
               const c=f.v?.includes("Bull")||f.v?.includes("With")?"#22c55e":f.v?.includes("Bear")||f.v?.includes("Against")?"#ef4444":"#eab308";
@@ -830,6 +976,12 @@ export default function App(){
   const[submitted,setSubmitted]=useState(()=>!!store.get("sf_key"));
   const[tab,setTab]=useState("intel");
   const[showDiag,setShowDiag]=useState(false);
+  const[tick,setTick]=useState(0); // forces re-render every minute so price % stays fresh
+
+  useEffect(()=>{
+    const t=setInterval(()=>setTick(v=>v+1),60000);
+    return()=>clearInterval(t);
+  },[]);
   const{status,market,news,momentum,fg,prices,newsLive,momentumLive,fgLive,lastNewsUpdate,log,error,refresh,refreshNews}=useMarket(submitted?apiKey:"");
   const isLoading=["fetching","analyzing"].includes(status);
   const ny=getNYTime();
